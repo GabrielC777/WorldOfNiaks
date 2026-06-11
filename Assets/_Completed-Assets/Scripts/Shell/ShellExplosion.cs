@@ -1,93 +1,135 @@
 using UnityEngine;
+using Photon.Pun;
 
 namespace Complete
 {
-    public class ShellExplosion : MonoBehaviour
+    public class ShellExplosion : MonoBehaviourPun, IPunInstantiateMagicCallback
     {
-        public LayerMask m_TankMask;                        // Used to filter what the explosion affects, this should be set to "Players".
-        public ParticleSystem m_ExplosionParticles;         // Reference to the particles that will play on explosion.
-        public AudioSource m_ExplosionAudio;                // Reference to the audio that will play on explosion.
-        public float m_MaxDamage = 100f;                    // The amount of damage done if the explosion is centred on a tank.
-        public float m_ExplosionForce = 1000f;              // The amount of force added to a tank at the centre of the explosion.
-        public float m_MaxLifeTime = 2f;                    // The time in seconds before the shell is removed.
-        public float m_ExplosionRadius = 5f;                // The maximum distance away from the explosion tanks can be and are still affected.
+        public LayerMask m_TankMask;
+        public ParticleSystem m_ExplosionParticles;
+        public AudioSource m_ExplosionAudio;
+        public float m_MaxDamage = 100f;
+        public float m_ExplosionForce = 1000f;
+        public float m_MaxLifeTime = 2f;
+        public float m_ExplosionRadius = 5f;
 
+        private bool m_YaHaExplotado = false;
 
-        private void Start ()
+        private void Start()
         {
-            // If it isn't destroyed by then, destroy the shell after it's lifetime.
-            Destroy (gameObject, m_MaxLifeTime);
+            // Programamos la autodestrucción por tiempo de seguridad
+            if (photonView != null && photonView.IsMine)
+            {
+                Invoke("DestroyBullet", m_MaxLifeTime);
+            }
+            // Si es una bala local de la IA (ViewID == 0), borrado tradicional
+            else if (photonView == null || photonView.ViewID == 0)
+            {
+                Destroy(gameObject, m_MaxLifeTime);
+            }
         }
 
-
-        private void OnTriggerEnter (Collider other)
+        private void OnTriggerEnter(Collider other)
         {
-			// Collect all the colliders in a sphere from the shell's current position to a radius of the explosion radius.
-            Collider[] colliders = Physics.OverlapSphere (transform.position, m_ExplosionRadius, m_TankMask);
+            // Evitamos rebotes o que la bala choque dos veces en el mismo frame
+            if (m_YaHaExplotado) return;
+            m_YaHaExplotado = true;
 
-            // Go through all the colliders...
-            for (int i = 0; i < colliders.Length; i++)
+            // Apagamos el colisionador de inmediato para que deje de interactuar físicamente
+            Collider miColisionador = GetComponent<Collider>();
+            if (miColisionador != null) miColisionador.enabled = false;
+
+            // CLASIFICAMOS LA BALA DE FORMA ESTRICTA:
+            bool esMiBalaDeJugador = photonView != null && photonView.IsMine;
+            bool esBalaDeLaIA = photonView == null || photonView.ViewID == 0;
+            bool soyMasterClient = PhotonNetwork.IsMasterClient;
+
+            // SOLO calculamos el daño a los tanques si la bala es MÍA, o si es de la IA y soy el MasterClient
+            if (esMiBalaDeJugador || (esBalaDeLaIA && soyMasterClient))
             {
-                // ... and find their rigidbody.
-                Rigidbody targetRigidbody = colliders[i].GetComponent<Rigidbody> ();
+                Collider[] colliders = Physics.OverlapSphere(transform.position, m_ExplosionRadius, m_TankMask);
+                for (int i = 0; i < colliders.Length; i++)
+                {
+                    Rigidbody targetRigidbody = colliders[i].GetComponent<Rigidbody>();
+                    if (!targetRigidbody) continue;
 
-                // If they don't have a rigidbody, go on to the next collider.
-                if (!targetRigidbody)
-                    continue;
+                    targetRigidbody.AddExplosionForce(m_ExplosionForce, transform.position, m_ExplosionRadius);
 
-                // Add an explosion force.
-                targetRigidbody.AddExplosionForce (m_ExplosionForce, transform.position, m_ExplosionRadius);
-
-                // Find the TankHealth script associated with the rigidbody.
-                TankHealth targetHealth = targetRigidbody.GetComponent<TankHealth> ();
-
-                // If there is no TankHealth script attached to the gameobject, go on to the next collider.
-                if (!targetHealth)
-                    continue;
-
-                // Calculate the amount of damage the target should take based on it's distance from the shell.
-                float damage = CalculateDamage (targetRigidbody.position);
-
-                // Deal this damage to the tank.
-                targetHealth.TakeDamage (damage);
+                    TankHealth targetHealth = targetRigidbody.GetComponentInParent<TankHealth>();
+                    if (targetHealth != null)
+                    {
+                        float damage = CalculateDamage(targetRigidbody.position);
+                        targetHealth.TakeDamage(damage);
+                    }
+                }
             }
 
-            // Unparent the particles from the shell.
-            m_ExplosionParticles.transform.parent = null;
-
-            // Play the particle system.
-            m_ExplosionParticles.Play();
-
-            // Play the explosion sound effect.
-            m_ExplosionAudio.Play();
-
-            // Once the particles have finished, destroy the gameobject they are on.
-            ParticleSystem.MainModule mainModule = m_ExplosionParticles.main;
-            Destroy (m_ExplosionParticles.gameObject, mainModule.duration);
-
-            // Destroy the shell.
-            Destroy (gameObject);
+            // 🎯 EL TRUCO PARA QUE PHOTON NO DE ERROR NUNCA MÁS:
+            if (esMiBalaDeJugador)
+            {
+                // 1. Es mi bala de red: La borro oficialmente por Photon.
+                PhotonNetwork.Destroy(gameObject);
+            }
+            else if (esBalaDeLaIA)
+            {
+                // 2. Es una bala local de un bot: La borro yo mismo.
+                Destroy(gameObject);
+            }
+            else
+            {
+                // 3. Es la bala de red de OTRO jugador: 
+                // ¡PROHIBIDO USAR DESTROY AQUÍ! Simplemente la hago invisible.
+                // Photon la borrará de verdad cuando llegue el mensaje del otro jugador.
+                MeshRenderer mr = GetComponent<MeshRenderer>();
+                if (mr != null) mr.enabled = false;
+            }
         }
 
-
-        private float CalculateDamage (Vector3 targetPosition)
+        // Se ejecuta cuando el objeto es destruido (sea por red o por código local)
+        private void OnDestroy()
         {
-            // Create a vector from the shell to the target.
+            if (m_ExplosionParticles != null)
+            {
+                // Desvinculamos las partículas para que no se borren
+                m_ExplosionParticles.transform.parent = null;
+                m_ExplosionParticles.Play();
+
+                // Filtro para evitar el error amarillo del audio
+                if (m_ExplosionAudio != null && m_ExplosionAudio.isActiveAndEnabled)
+                {
+                    m_ExplosionAudio.Play();
+                }
+
+                Destroy(m_ExplosionParticles.gameObject, m_ExplosionParticles.main.duration);
+            }
+        }
+
+        public void OnPhotonInstantiate(PhotonMessageInfo info)
+        {
+            object[] datos = info.photonView.InstantiationData;
+            if (datos != null && datos.Length > 0)
+            {
+                Vector3 velocidadRecibida = (Vector3)datos[0];
+                Rigidbody rb = GetComponent<Rigidbody>();
+                if (rb != null)
+                {
+                    rb.velocity = velocidadRecibida;
+                }
+            }
+        }
+
+        void DestroyBullet()
+        {
+            if (photonView != null && photonView.IsMine) PhotonNetwork.Destroy(gameObject);
+        }
+
+        private float CalculateDamage(Vector3 targetPosition)
+        {
             Vector3 explosionToTarget = targetPosition - transform.position;
-
-            // Calculate the distance from the shell to the target.
             float explosionDistance = explosionToTarget.magnitude;
-
-            // Calculate the proportion of the maximum distance (the explosionRadius) the target is away.
             float relativeDistance = (m_ExplosionRadius - explosionDistance) / m_ExplosionRadius;
-
-            // Calculate damage as this proportion of the maximum possible damage.
             float damage = relativeDistance * m_MaxDamage;
-
-            // Make sure that the minimum damage is always 0.
-            damage = Mathf.Max (0f, damage);
-
-            return damage;
+            return Mathf.Max(0f, damage);
         }
     }
 }
